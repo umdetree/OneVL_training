@@ -113,65 +113,108 @@ def tgz_url(shard_name: str) -> str:
     return f"{HF_BASE}/openscene-v1.1/openscene_sensor_trainval_camera/openscene_sensor_trainval_camera_{shard_num}.tgz"
 
 
+def _list_pending_files(
+    needed_sessions: set[str],
+    needed_files: dict[str, list[dict]],
+    output_root: Path,
+) -> tuple[set[str], list[tuple[str, str, str]]]:
+    """Return (want_internal_paths, pending_entries) for files not yet on disk."""
+    want: set[str] = set()
+    pending: list[tuple[str, str, str]] = []  # (sess, cam, fname)
+    for sess in needed_sessions:
+        for entry in needed_files.get(sess, []):
+            sess_id = entry["session_id"]
+            cam = entry["cam"]
+            fname = entry["filename"]
+            out = output_root / "sensor_blobs" / "trainval" / sess_id / cam / fname
+            internal = f"openscene-v1.1/sensor_blobs/trainval/{sess_id}/{cam}/{fname}"
+            if out.exists():
+                continue
+            want.add(internal)
+            pending.append((sess_id, cam, fname))
+    return want, pending
+
+
+def _download_file(url: str, dest: Path) -> None:
+    """Stream a URL to a local file with progress."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    resp = http_stream(url)
+    total = int(resp.headers.get("Content-Length", 0))
+    downloaded = 0
+    chunk = 16 * 1024 * 1024
+
+    with open(dest, "wb") as f:
+        while True:
+            buf = resp.read(chunk)
+            if not buf:
+                break
+            f.write(buf)
+            downloaded += len(buf)
+            pct = downloaded / total * 100 if total else 0
+            print(f"\r  Downloading: {downloaded/1024/1024:.0f}/{total/1024/1024:.0f} MB ({pct:.0f}%)", end="", flush=True)
+    print()
+
+
+def _extract_one(tar: tarfile.TarFile, internal: str, output_root: Path) -> bool:
+    """Extract a single file from tar to output_root, return True on success."""
+    try:
+        member = tar.getmember(internal)
+    except KeyError:
+        return False
+    if not member.isfile():
+        return False
+
+    parts = Path(internal).parts  # openscene-v1.1/sensor_blobs/trainval/{sess}/{cam}/{fname}
+    if len(parts) < 6:
+        return False
+    sess, cam, fname = parts[3], parts[4], parts[5]
+    out = output_root / "sensor_blobs" / "trainval" / sess / cam / fname
+    if out.exists():
+        return True  # already there, count as success
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    src = tar.extractfile(member)
+    if src is None:
+        return False
+    with open(out, "wb") as dst:
+        dst.write(src.read())
+    return True
+
+
 def download_and_extract_selective(
     shard_name: str,
     needed_sessions: set[str],
     needed_files: dict[str, list[dict]],
     output_root: Path,
 ) -> int:
-    url = tgz_url(shard_name)
-    tgz_filename = url.rsplit("/", 1)[-1]
-    local_tgz = Path(".claude_tmp") / tgz_filename
-    local_tgz.parent.mkdir(parents=True, exist_ok=True)
+    want_internal, pending = _list_pending_files(needed_sessions, needed_files, output_root)
+    if not pending:
+        print(f"  All files already exist in {shard_name}, skipping")
+        return 0
 
-    # Build set of internal tgz paths we need
-    # tgz internal: openscene-v1.1/sensor_blobs/trainval/{session}/{cam}/{file}
-    want_internal: set[str] = set()
-    for sess in needed_sessions:
-        for entry in needed_files.get(sess, []):
-            want_internal.add(
-                f"openscene-v1.1/sensor_blobs/trainval/{entry['session_id']}/{entry['cam']}/{entry['filename']}"
-            )
+    url = tgz_url(shard_name)
+    tgz_name = url.rsplit("/", 1)[-1]
+    local_tgz = Path(".claude_tmp") / tgz_name
 
     try:
-        print(f"  Downloading {tgz_filename} (~4.7GB)...", flush=True)
-        resp = http_stream(url)
-        total_size = int(resp.headers.get("Content-Length", 0))
-        downloaded = 0
-        chunk_size = 16 * 1024 * 1024
+        print(f"  Downloading {tgz_name} (~4.7GB)...", flush=True)
+        _download_file(url, local_tgz)
 
-        with open(local_tgz, "wb") as f:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                pct = downloaded / total_size * 100 if total_size else 0
-                print(f"\r  Downloading: {downloaded/1024/1024:.0f}/{total_size/1024/1024:.0f} MB ({pct:.0f}%)", end="", flush=True)
-        print()
-
-        print(f"  Extracting needed files ...", flush=True)
-        extracted_count = 0
+        print(f"  Extracting {len(pending)} needed files ...", flush=True)
+        extracted = 0
         with tarfile.open(local_tgz, "r:gz") as tar:
-            for member in tar.getmembers():
-                if not member.isfile():
-                    continue
-                if member.name in want_internal:
-                    parts = Path(member.name).parts
-                    if len(parts) >= 6:
-                        sess, cam, fname = parts[3], parts[4], parts[5]
-                        out_path = output_root / "sensor_blobs" / "trainval" / sess / cam / fname
-                        out_path.parent.mkdir(parents=True, exist_ok=True)
-                        src_f = tar.extractfile(member)
-                        if src_f is not None:
-                            with open(out_path, "wb") as dst_f:
-                                dst_f.write(src_f.read())
-                            extracted_count += 1
-                            print(f"    ✓ {sess}/{cam}/{fname}")
+            for internal in want_internal:
+                ok = _extract_one(tar, internal, output_root)
+                if ok:
+                    extracted += 1
+                    p = Path(internal).parts  # openscene-v1.1/sensor_blobs/trainval/{sess}/{cam}/{fname}
+                    print(f"    ✓ {p[3]}/{p[4]}/{p[5]}")
+                else:
+                    p = Path(internal).parts
+                    print(f"    ✗ {p[3]}/{p[4]}/{p[5]} (not found in archive)")
 
-        print(f"  Extracted {extracted_count} files from {tgz_filename}")
-        return extracted_count
+        print(f"  Extracted {extracted} files from {tgz_name}")
+        return extracted
 
     except Exception as e:
         print(f"  [ERROR] {shard_name}: {e}")
@@ -181,7 +224,7 @@ def download_and_extract_selective(
     finally:
         if local_tgz.exists():
             local_tgz.unlink()
-            print(f"  Cleaned up {tgz_filename}")
+            print(f"  Cleaned up {tgz_name}")
 
 
 def main():
