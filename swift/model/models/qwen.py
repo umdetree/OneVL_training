@@ -1145,6 +1145,61 @@ register_model(
         tags=['vision', 'video']))
 
 
+class Qwen3VLVisualAuxPretrainLoader(Qwen3VLLoader):
+    """Loader that wraps Qwen3-VL for visual aux decoder pretrain (Stage 0.5).
+
+    Only loads the visual aux decoder (no text aux decoder, no latent tokens).
+    Main model is frozen and used only for ViT embedding extraction.
+    """
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        model = super().get_model(model_dir, config, processor, model_kwargs)
+
+        from swift.model.models.latent_cot import LatentCoTConfig, patch_model_for_visual_aux_pretrain
+        vis_aux_path = get_env_args('LATENT_COT_VISUAL_AUX_MODEL_PATH', str, None)
+        if not vis_aux_path:
+            raise ValueError(
+                'LATENT_COT_VISUAL_AUX_MODEL_PATH is required for '
+                'qwen3_vl_visual_aux_pretrain model type.')
+        latent_config = LatentCoTConfig(
+            c_thought=2,
+            c_thought_visual=2,
+            aux_model_path=None,  # no text aux decoder
+            visual_aux_model_path=vis_aux_path,
+            explain_loss_weight=0.0,  # no text aux loss
+            visual_explain_loss_weight=get_env_args('LATENT_COT_VISUAL_EXPLAIN_LOSS_WEIGHT', float, 1.0),
+            aux_visual_condition=False,  # no text aux decoder
+            visual_aux_visual_condition=get_env_args('LATENT_COT_VISUAL_AUX_VISUAL_CONDITION', bool, True),
+            use_separate_visual_latent_tokens=False,
+            freeze_visual_aux_decoder=False,  # we train the visual aux decoder
+            freeze_aux_decoder=True,  # no text aux decoder to train
+            freeze_main_model=True,  # freeze main model
+            latent_ce_loss=False,
+            latent_use_all_subtokens=False,
+            tokens_as_special=True,
+            use_original_vocab=False,
+        )
+        patch_model_for_visual_aux_pretrain(model, processor, latent_config)
+        return model
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.qwen3_vl_visual_aux_pretrain, [
+            ModelGroup([
+                Model('Qwen/Qwen3-VL-2B-Instruct', 'Qwen/Qwen3-VL-2B-Instruct'),
+                Model('Qwen/Qwen3-VL-8B-Instruct', 'Qwen/Qwen3-VL-8B-Instruct'),
+                Model('Qwen/Qwen3-VL-2B-Thinking', 'Qwen/Qwen3-VL-2B-Thinking'),
+                Model('Qwen/Qwen3-VL-8B-Thinking', 'Qwen/Qwen3-VL-8B-Thinking'),
+            ], TemplateType.qwen3_vl_visual_aux_pretrain),
+        ],
+        Qwen3VLVisualAuxPretrainLoader,
+        model_arch=ModelArch.qwen3_vl,
+        architectures=['Qwen3VLForConditionalGeneration'],
+        requires=['transformers>=4.57', 'qwen_vl_utils>=0.0.14', 'decord'],
+        tags=['vision', 'video']))
+
+
 class Qwen3VLMoeLoader(Qwen3VLLoader):
 
     def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:

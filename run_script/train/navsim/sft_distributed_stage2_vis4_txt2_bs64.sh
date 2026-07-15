@@ -30,8 +30,8 @@ MASTER_ADDR=${WORKER_0_HOST:-127.0.0.1}
 MASTER_PORT=${WORKER_0_PORT:-29500}
 
 # ---------- Model paths ----------
-MODEL_PATH="qwen3vl/Qwen3-VL-4B-Instruct" ## previous stage2 model path
-AUX_MODEL_PATH="qwen3vl/Qwen3-VL-4B-Instruct"
+MODEL_PATH="qwen3vl/Qwen3-VL-2B-Instruct" ## previous stage2 model path
+AUX_MODEL_PATH="qwen3vl/Qwen3-VL-2B-Instruct"
 # VISUAL_AUX_MODEL_PATH="/qwen3_vl_visual_aux_decoder_ad/checkpoints/global_step_13040/hf_ckpt"
 VISUAL_AUX_MODEL_PATH="models/visual_aux_decoder/qwen3_vl_visual_aux_decoder_ad_512/checkpoints/global_step_13040/hf_ckpt" ## pretrain visual aux decoder model path
 DATASET_PATH="${SCRIPT_DIR}/demo_data/navsim/navsim_vis4_text2_demo100.jsonl"

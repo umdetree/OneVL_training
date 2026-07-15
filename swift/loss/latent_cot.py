@@ -45,19 +45,50 @@ class LatentCoTLoss(BaseLoss):
 
         explain_loss = cache.get('explain_loss', torch.tensor(0.0))
         visual_explain_loss = cache.get('visual_explain_loss', torch.tensor(0.0))
+        skip_student_ce = cache.get('skip_student_ce', False)
 
-        logits = outputs.logits.float()
-        shifted_labels = torch.roll(labels, shifts=-1, dims=-1).view(-1)
-        logits_flat = logits.view(-1, logits.shape[-1])
-        per_token = F.cross_entropy(
-            logits_flat, shifted_labels.to(logits.device),
-            ignore_index=-100, reduction='none')
+        if skip_student_ce:
+            # Pretrain mode: main model is frozen, no need to compute CE from logits.
+            # This avoids materialising the large logits tensor in fp32.
+            student_ce_loss = torch.tensor(0.0, device=outputs.logits.device)
+            student_ce_mean = torch.tensor(0.0)
+            n_valid = num_items_in_batch if num_items_in_batch is not None else 1
+        else:
+            # --- Chunked CE loss to avoid OOM on large logits ---
+            # logits [batch, seq, vocab] can be very large (e.g. 2.5 GB fp32 for
+            # seq=4096, vocab=151936).  We compute CE loss in chunks along the
+            # sequence dimension, which produces identical results because
+            # F.cross_entropy is applied per-token independently.
+            chunk_size = 512
+            logits = outputs.logits  # keep in original dtype (bf16)
+            shifted_labels = torch.roll(labels, shifts=-1, dims=-1)  # [batch, seq]
 
-        n_valid = (shifted_labels != -100).sum().clamp(min=1)
-        if num_items_in_batch is None:
-            num_items_in_batch = n_valid
+            total_ce = torch.tensor(0.0, device=logits.device)
+            n_valid = torch.tensor(0, device=logits.device, dtype=torch.long)
 
-        student_ce_loss = per_token.sum() / num_items_in_batch
+            seq_len = logits.shape[1]
+            for c_start in range(0, seq_len, chunk_size):
+                c_end = min(c_start + chunk_size, seq_len)
+                chunk_logits = logits[:, c_start:c_end, :].float()  # [batch, chunk, vocab] fp32
+                chunk_labels = shifted_labels[:, c_start:c_end]      # [batch, chunk]
+
+                chunk_per_token = F.cross_entropy(
+                    chunk_logits.reshape(-1, chunk_logits.shape[-1]),
+                    chunk_labels.reshape(-1).to(chunk_logits.device),
+                    ignore_index=-100, reduction='none')
+
+                chunk_valid = (chunk_labels.reshape(-1) != -100).sum()
+                total_ce = total_ce + chunk_per_token.sum()
+                n_valid = n_valid + chunk_valid
+
+                del chunk_logits, chunk_labels, chunk_per_token
+
+            n_valid = n_valid.clamp(min=1)
+            if num_items_in_batch is None:
+                num_items_in_batch = n_valid
+
+            student_ce_loss = total_ce / num_items_in_batch
+            student_ce_mean = total_ce / n_valid
 
         # Scale aux losses by this micro-batch's fraction of the full batch
         batch_weight = n_valid.float() / num_items_in_batch
@@ -67,7 +98,6 @@ class LatentCoTLoss(BaseLoss):
         total_loss = student_ce_loss + explain_weighted + vis_explain_weighted
 
         # Log unscaled mean values as custom metrics
-        student_ce_mean = per_token.sum() / n_valid
         if trainer is not None and hasattr(trainer, 'custom_metrics'):
             mode = 'train' if trainer.model.training else 'eval'
             metrics = trainer.custom_metrics[mode]

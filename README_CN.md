@@ -31,7 +31,7 @@
 
 > During training, hidden states at visual latent positions are routed to the **Visual Aux. Decoder** (predicts future-frame visual tokens at t+0.5s and t+1.0s) and at language latent positions to the **Language Aux. Decoder** (reconstructs CoT text). Both decoders are discarded at inference; all latent tokens are **prefilled** into the prompt, matching answer-only AR prediction latency.
 
-OneVL augments **Qwen3-VL-4B-Instruct** with:
+OneVL augments **Qwen3-VL-2B-Instruct** with:
 
 - **Latent Token Interface** — 4 visual latent tokens + 2 language latent tokens placed in the assistant response before the answer, using existing vocabulary tokens (no new special tokens).
 - **Visual Auxiliary Decoder** — Predicts future-frame visual tokens at t+0.5s and t+1.0s from visual latent hidden states (Emu3.5 IBQ, 131k codebook), acting as a **world model** supervision signal.
@@ -216,7 +216,7 @@ pip install -e .
 
 | Model | HuggingFace |
 |-------|-------------|
-| Qwen3-VL-4B-Instruct | [Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) |
+| Qwen3-VL-2B-Instruct | [Qwen/Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) |
 | OneVL model weights | [xiaomi-research/onevl-models](https://huggingface.co/collections/xiaomi-research/onevl-models/) |
 
 3. **Prepare demo data**: 100-sample demo datasets are provided under `demo_data/navsim/` for quick verification.
@@ -239,7 +239,7 @@ bash run_script/train/navsim/sft_distributed_qwen3vl_answer_bs64.sh
 
 Key config in the script:
 ```bash
-MODEL_PATH="<path/to/Qwen3-VL-4B-Instruct>"
+MODEL_PATH="<path/to/Qwen3-VL-2B-Instruct>"
 DATASET_PATH="demo_data/navsim/navsim_answer_demo100.jsonl"  # replace with full dataset
 # --model_type qwen3_vl   (standard SFT, no latent CoT)
 # --deepspeed zero2
@@ -341,7 +341,7 @@ If you find this work useful, please cite:
 
 This project is released under the [Apache 2.0 License](LICENSE).
 
-Model weights are built on [Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct) and the visual tokenizer is from [Emu3.5-VisionTokenizer](https://huggingface.co/BAAI/Emu3.5-VisionTokenizer); please refer to their respective licenses as well.
+Model weights are built on [Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct) and the visual tokenizer is from [Emu3.5-VisionTokenizer](https://huggingface.co/BAAI/Emu3.5-VisionTokenizer); please refer to their respective licenses as well.
 
 ---
 

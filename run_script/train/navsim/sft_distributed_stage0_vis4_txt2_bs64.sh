@@ -30,7 +30,7 @@ MASTER_ADDR=${WORKER_0_HOST:-127.0.0.1}
 MASTER_PORT=${WORKER_0_PORT:-29500}
 
 # ---------- Model paths ----------
-MODEL_PATH="qwen3vl/Qwen3-VL-4B-Instruct"
+MODEL_PATH="qwen3vl/Qwen3-VL-2B-Instruct"
 DATASET_PATH="${SCRIPT_DIR}/demo_data/navsim/navsim_vis4_text2_demo100.jsonl"
 
 # ---------- Launch training ----------

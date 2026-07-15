@@ -643,6 +643,14 @@ register_template(
         thinking_prefix='<think>\n'))
 
 
+register_template(
+    QwenTemplateMeta(
+        MLLMTemplateType.qwen3_vl_visual_aux_pretrain,
+        template_cls=Qwen3VLLatentCoTTemplate,
+        default_system=None,
+        thinking_prefix='<think>\n'))
+
+
 class Qwen3_5Template(Qwen3VLTemplate):
     image_token_id = 248056
     video_token_id = 248057

@@ -566,7 +566,7 @@ def main():
                         help="Enable text aux decoder to explain latent reasoning")
     parser.add_argument("--aux_model_path", type=str, default=None,
                         help="Base architecture path for aux decoder "
-                             "(e.g. Qwen3-VL-4B-Instruct-latent). "
+                             "(e.g. Qwen3-VL-2B-Instruct-latent). "
                              "Weights are loaded from the main checkpoint.")
     parser.add_argument("--aux_visual_condition", action="store_true",
                         help="Condition aux decoder on visual tokens")

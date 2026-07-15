@@ -261,9 +261,9 @@ def main():
 
     # ── LIMIT: only first 2 shards for testing ──
     # Remove this block to process all shards
-    limited_shards = dict(sorted(shard_to_sessions.items())[:2])
-    print(f"\n  [TEST MODE] Limiting to 2 shards: {list(limited_shards.keys())}")
-    shard_to_sessions = limited_shards
+    # limited_shards = dict(sorted(shard_to_sessions.items())[:2])
+    # print(f"\n  [TEST MODE] Limiting to 2 shards: {list(limited_shards.keys())}")
+    # shard_to_sessions = limited_shards
     # ─────────────────────────────────────────────
 
     try:

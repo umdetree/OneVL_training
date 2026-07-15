@@ -30,7 +30,7 @@ MASTER_ADDR=${WORKER_0_HOST:-127.0.0.1}
 MASTER_PORT=${WORKER_0_PORT:-29500}
 
 # ---------- Model paths ----------
-MODEL_PATH="qwen3vl/Qwen3-VL-4B-Instruct"
+MODEL_PATH="qwen3vl/Qwen3-VL-2B-Instruct"
 DATASET_PATH="${SCRIPT_DIR}/demo_data/navsim/navsim_cot_demo100.jsonl"
 
 
@@ -67,6 +67,6 @@ swift sft \
     --freeze_llm False \
     --freeze_vit False \
     --dataloader_num_workers 8 \
-    --output_dir "${SCRIPT_DIR}/outputs/navsim/qwen3vl_4b_stage0_cot" \
+    --output_dir "${SCRIPT_DIR}/outputs/navsim/qwen3vl_2b_stage0_cot" \
     --deepspeed zero2 \
-  2>&1 | tee "${SCRIPT_DIR}/logs/navsim/qwen3vl_4b_stage0_cot.log"
+  2>&1 | tee "${SCRIPT_DIR}/logs/navsim/qwen3vl_2b_stage0_cot.log"

@@ -138,6 +138,28 @@ def _get_aux_input_embeddings(aux_decoder):
     return aux_decoder.get_input_embeddings()
 
 
+def _get_aux_lm_head(aux_decoder):
+    """Get the LM-Head (output projection) from an aux decoder model.
+
+    Used by chunked LM-Head computation to apply the output projection
+    per-chunk instead of materialising the full logits tensor.
+    """
+    # Direct attribute
+    if hasattr(aux_decoder, 'lm_head'):
+        return aux_decoder.lm_head
+    # Nested: model.language_model.lm_head (Qwen3-VL structure)
+    inner = getattr(aux_decoder, 'model', None)
+    if inner is not None:
+        if hasattr(inner, 'lm_head'):
+            return inner.lm_head
+        lm = getattr(inner, 'language_model', None)
+        if lm is not None and hasattr(lm, 'lm_head'):
+            return lm.lm_head
+    raise AttributeError(
+        f'Cannot find lm_head on aux decoder of type {type(aux_decoder).__name__}. '
+        f'Available top-level attributes: {list(dir(aux_decoder))[:20]}')
+
+
 def _extract_visual_embeds(student_embeds, batch_idx, input_ids, image_token_id, video_token_id=None):
     dev = student_embeds.device
     vis_mask = (input_ids[batch_idx] == image_token_id)
@@ -423,6 +445,148 @@ def compute_visual_explain_loss(
     return loss_all
 
 
+def compute_visual_aux_pretrain_loss(
+    visual_ids_list,
+    batch_size, visual_aux_decoder,
+    student_embeds, input_ids,
+    image_token_id=None, video_token_id=None,
+    debug_aux_vit_holder: Optional[dict] = None,
+    chunk_size: int = 512,
+):
+    """Compute visual auxiliary decoder pretrain loss (Stage 0.5).
+
+    Unlike ``compute_visual_explain_loss``, this function does NOT use latent
+    embeddings.  The input to the visual aux decoder is simply
+    ``[ViT_embeds, target_embeds]``, where ViT_embeds are the current-frame
+    visual embeddings captured via hook.  This corresponds to the
+    "unconditional prior" pretrain stage described in the paper:
+
+        "we first train the decoder with a strong unconditional prior — given
+        the current-frame ViT embeddings, predict what the scene will look
+        like at the next two timestamps — before introducing the latent
+        conditioning signal."
+
+    To avoid OOM on long target sequences (e.g. 6000+ future image tokens),
+    we use a **chunked LM-Head & Cross Entropy** approach:
+    1. Forward the entire sequence through the aux decoder normally
+       (preserving full causal attention).
+    2. Discard the full logits tensor; keep only the last hidden states
+       (which are small: ~25 MB for 6300 tokens).
+    3. Apply the LM-Head projection and CE loss in chunks of
+       ``chunk_size`` tokens.  Since the LM-Head is a per-token independent
+       linear transformation, chunking produces identical results to
+       computing all logits at once, but uses far less peak memory.
+    """
+    if visual_aux_decoder is None or visual_ids_list is None:
+        return torch.tensor(0.0, device=student_embeds.device)
+
+    vis_aux_embedding = _get_aux_input_embeddings(visual_aux_decoder)
+    loss_fct = CrossEntropyLoss(reduction='sum')
+    loss_all = torch.tensor(0.0, device=student_embeds.device)
+    num_items = 0
+
+    # Get lm_head for chunked projection
+    lm_head = _get_aux_lm_head(visual_aux_decoder)
+
+    for b in range(batch_size):
+        vis_token_ids = visual_ids_list[b] if b < len(visual_ids_list) else None
+        if not vis_token_ids or len(vis_token_ids) == 0:
+            continue
+
+        # Extract ViT embeddings (visual condition) — this is the ONLY condition
+        vis_embeds = None
+        n_vis = 0
+        if student_embeds is not None and image_token_id is not None:
+            vis_embeds = _extract_visual_embeds(
+                student_embeds, b, input_ids, image_token_id, video_token_id)
+            if vis_embeds is not None:
+                n_vis = vis_embeds.shape[0]
+
+        if vis_embeds is None:
+            continue  # No ViT condition — skip this sample
+
+        _record_aux_vit_for_debug(debug_aux_vit_holder, 'visual_aux_vit', b, vis_embeds)
+
+        target_tensor = torch.tensor(
+            vis_token_ids, device=student_embeds.device, dtype=torch.long)
+        target_embeds = vis_aux_embedding(target_tensor)
+
+        # Concatenate: [ViT_embeds, target_embeds] — NO latent embeds
+        combined_embeds = torch.cat([vis_embeds, target_embeds], dim=0).unsqueeze(0)
+        seq_len = combined_embeds.shape[1]
+        attn_mask = torch.ones(1, seq_len, dtype=torch.long, device=student_embeds.device)
+
+        logger.info_once(
+            f'[VisualAuxPretrain input] n_vis={n_vis}, '
+            f'n_target_tokens={len(vis_token_ids)}, '
+            f'combined_shape={combined_embeds.shape}, chunk_size={chunk_size}')
+
+        # Step 1: Forward through aux decoder — keep hidden states, discard logits
+        # logits_to_keep=1: only keep last token's logits (tiny), since we compute
+        # CE loss via chunked lm_head on hidden_states afterwards.  Without this,
+        # Qwen3-VL internally computes lm_head(all_tokens) ≈ 2.4 GiB → OOM.
+        vis_aux_outputs = visual_aux_decoder(
+            inputs_embeds=combined_embeds,
+            attention_mask=attn_mask,
+            logits_to_keep=1,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+
+        # Get last hidden states (small: ~25 MB for 6300 tokens at hidden=2048)
+        last_hidden = vis_aux_outputs.hidden_states[-1]  # [1, seq_len, hidden]
+
+        # Build labels: ViT prefix is -100, target part is ground truth
+        prefix_len = n_vis
+        labels = torch.full(
+            (1, seq_len), -100,
+            dtype=torch.long, device=student_embeds.device)
+        labels[0, prefix_len:] = target_tensor
+
+        # Immediately free the large logits tensor and output object
+        del vis_aux_outputs
+        del combined_embeds, attn_mask
+        torch.cuda.empty_cache()
+
+        # Step 2: Chunked LM-Head projection + CE loss
+        # LM-Head is a per-token independent linear layer, so chunking
+        # produces identical results to computing all logits at once.
+        shift_labels = labels[0, 1:]  # [seq_len-1]
+        total_loss = torch.tensor(0.0, device=student_embeds.device)
+        total_effective = 0
+
+        n_tokens = last_hidden.shape[1] - 1  # shifted by 1
+        for c_start in range(0, n_tokens, chunk_size):
+            c_end = min(c_start + chunk_size, n_tokens)
+            # hidden at position i predicts token at position i+1 (shifted)
+            chunk_hidden = last_hidden[0, c_start:c_end]  # [chunk, hidden]
+            chunk_labels = shift_labels[c_start:c_end]    # [chunk]
+
+            chunk_logits = lm_head(chunk_hidden)  # [chunk, vocab] bf16
+
+            effective_mask = (chunk_labels != -100)
+            effective_tokens = effective_mask.sum()
+            if effective_tokens > 0:
+                # Only compute CE for effective positions to save memory
+                eff_logits = chunk_logits[effective_mask].float()  # fp32 for numerical stability
+                eff_labels = chunk_labels[effective_mask]
+                item_loss = loss_fct(eff_logits, eff_labels)
+                total_loss = total_loss + item_loss
+                total_effective += effective_tokens.item()
+
+            del chunk_logits, chunk_hidden, chunk_labels, effective_mask
+
+        if total_effective > 0:
+            loss_all = loss_all + total_loss / total_effective
+            num_items += 1
+
+        del last_hidden, labels, shift_labels
+
+    if num_items > 0:
+        loss_all = loss_all / num_items
+    return loss_all
+
+
 def _tokenize_think_steps(think_steps_text, tokenizer):
     eos_id = tokenizer.eos_token_id
     if isinstance(think_steps_text, str):
@@ -689,6 +853,55 @@ def find_latent_mask_region(ids_list, marker_component_ids, latent_keyword_id):
     return mask
 
 
+def patch_model_for_visual_aux_pretrain(model, processor, config: LatentCoTConfig):
+    """Patch a Qwen3-VL model in-place for visual aux decoder pretrain (Stage 0.5).
+
+    Compared to ``patch_model_for_latent_cot``, this function:
+    - Does NOT add latent tokens to the tokenizer (no latent tokens needed)
+    - Does NOT build a text aux decoder (only visual aux decoder)
+    - Does NOT create latent_proj (no latent embeddings to project)
+    - Replaces forward with ``_latent_cot_forward_visual_aux_pretrain``
+    """
+    model._latent_cot_config = config
+    model._latent_token_ids = {}  # empty — no latent tokens
+    model._processor_ref = processor
+
+    base_hidden_size = _resolve_hidden_size(model)
+
+    # Only build visual aux decoder
+    if config.visual_aux_model_path:
+        logger.info(f'[VisualAuxPretrain] Building visual_aux_decoder from: {config.visual_aux_model_path}')
+        vis_aux_decoder = build_aux_decoder(config.visual_aux_model_path, device='cpu')
+        vis_aux_hidden = _resolve_hidden_size(vis_aux_decoder)
+        visual_latent_proj = nn.Sequential(
+            nn.Linear(base_hidden_size, base_hidden_size),
+            nn.GELU(),
+            nn.Linear(base_hidden_size, vis_aux_hidden),
+            nn.LayerNorm(vis_aux_hidden),
+        )
+        model.add_module('_latent_cot_visual_aux_decoder', vis_aux_decoder)
+        model.add_module('_latent_cot_visual_latent_proj', visual_latent_proj)
+
+        from transformers import AutoTokenizer
+        model._latent_cot_visual_aux_tokenizer = AutoTokenizer.from_pretrained(
+            config.visual_aux_model_path, trust_remote_code=True)
+    else:
+        raise ValueError(
+            'visual_aux_model_path is required for visual aux decoder pretrain. '
+            'Set LATENT_COT_VISUAL_AUX_MODEL_PATH environment variable.')
+
+    # No text aux decoder
+    model._latent_cot_aux_decoder = None
+    model._latent_cot_latent_proj = None
+
+    # Replace forward
+    model._origin_forward_for_latent_cot = model.forward
+    model.forward = MethodType(_latent_cot_forward_visual_aux_pretrain, model)
+
+    logger.info('[VisualAuxPretrain] Model patched for visual aux decoder pretrain.')
+    return model
+
+
 def patch_model_for_latent_cot(model, processor, config: LatentCoTConfig, model_dir: Optional[str] = None):
     """Patch a Qwen3-VL model in-place for latent CoT training.
 
@@ -875,6 +1088,134 @@ def load_latent_cot_weights(model, model_dir: str) -> None:
             f'(missing in ckpt: {len(missing)}, unexpected: {len(unexpected)})')
         if unexpected:
             logger.warning(f'Unexpected keys when loading latent CoT weights: {unexpected}')
+
+
+def _latent_cot_forward_visual_aux_pretrain(
+    self, input_ids=None, attention_mask=None, position_ids=None,
+    labels=None, pixel_values=None, pixel_values_videos=None,
+    image_grid_thw=None, video_grid_thw=None,
+    think_steps=None, future_image_tokens=None,
+    **kwargs,
+):
+    """Patched forward for visual aux decoder pretrain (Stage 0.5).
+
+    Unlike ``_latent_cot_forward``, this function:
+    - Does NOT look for latent tokens (there are none)
+    - Only computes visual aux decoder pretrain loss
+    - The visual aux decoder receives [ViT_embeds, target_embeds] directly,
+      with no latent conditioning
+    - Main model is frozen; only the visual aux decoder is trained
+    """
+    config = self._latent_cot_config
+    visual_aux_decoder = getattr(self, '_latent_cot_visual_aux_decoder', None)
+
+    need_visual = (future_image_tokens is not None and visual_aux_decoder is not None)
+
+    # Register ViT hook to capture embeddings (same mechanism as _latent_cot_forward)
+    _vit_hook_handle = None
+    self._captured_vit_embeds = None
+    if config.visual_aux_visual_condition and need_visual:
+        def _capture_vit_embeds_hook(module, args, kwargs):
+            ie = kwargs.get('inputs_embeds')
+            if ie is not None:
+                self._captured_vit_embeds = ie.detach()
+            return None
+        _lm = getattr(getattr(self, 'model', None), 'language_model', None)
+        if _lm is not None:
+            _vit_hook_handle = _lm.register_forward_pre_hook(
+                _capture_vit_embeds_hook, with_kwargs=True)
+
+    # Run original forward — need hidden states for ViT hook + CE loss
+    outputs = self._origin_forward_for_latent_cot(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        labels=labels,
+        pixel_values=pixel_values,
+        pixel_values_videos=pixel_values_videos,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        output_hidden_states=need_visual,
+        **kwargs,
+    )
+
+    if _vit_hook_handle is not None:
+        _vit_hook_handle.remove()
+
+    dev = (outputs.loss.device if outputs.loss is not None
+           else (input_ids.device if input_ids is not None else 'cuda'))
+    student_ce_loss = outputs.loss if outputs.loss is not None else None
+
+    visual_explain_loss = torch.tensor(0.0, device=dev)
+
+    if need_visual:
+        batch_size = input_ids.size(0)
+        vis_tokenizer = getattr(self, '_latent_cot_visual_aux_tokenizer', None)
+        if vis_tokenizer is not None:
+            visual_ids_list = _tokenize_visual_targets(future_image_tokens, vis_tokenizer)
+
+            image_token_id = getattr(self.config, 'image_token_id', None)
+            video_token_id = getattr(self.config, 'video_token_id', None)
+
+            debug_aux_vit_holder = {} if _latent_cot_debug_aux_vit_embed() else None
+
+            student_embeds = None
+            if config.visual_aux_visual_condition:
+                student_embeds = self._captured_vit_embeds
+                if student_embeds is not None:
+                    _img_tid = getattr(self.config, 'image_token_id', None)
+                    if _img_tid is not None and input_ids is not None:
+                        _vis_mask = (input_ids[0] == _img_tid)
+                        if _vis_mask.any():
+                            _vit_std = student_embeds[0][_vis_mask].float().std(dim=0).mean().item()
+                            logger.info_once(
+                                f'[VisualAuxPretrain] Using ViT-injected embeddings '
+                                f'(shape={student_embeds.shape}, '
+                                f'n_img_tokens={_vis_mask.sum().item()}, '
+                                f'vit_embed_std_across_positions={_vit_std:.6f})')
+                else:
+                    embed_fn = (self.model.get_input_embeddings()
+                                if hasattr(self, 'model')
+                                else self.get_input_embeddings())
+                    student_embeds = embed_fn(input_ids)
+                    logger.warning_once(
+                        '[VisualAuxPretrain] Hook failed to capture ViT embeddings, '
+                        'falling back to placeholder embeddings')
+
+            visual_explain_loss = compute_visual_aux_pretrain_loss(
+                visual_ids_list,
+                batch_size, visual_aux_decoder,
+                student_embeds, input_ids,
+                image_token_id=image_token_id,
+                video_token_id=video_token_id,
+                debug_aux_vit_holder=debug_aux_vit_holder,
+            )
+            visual_explain_loss = visual_explain_loss * config.visual_explain_loss_weight
+
+            _flush_aux_vit_debug_compare(debug_aux_vit_holder)
+
+    # Store aux losses on the model (same pattern as _latent_cot_forward)
+    self._latent_cot_cache = {
+        'student_ce_loss': student_ce_loss,
+        'explain_loss': torch.tensor(0.0, device=dev),
+        'visual_explain_loss': visual_explain_loss,
+        'skip_student_ce': True,  # pretrain: main model frozen, skip CE from logits
+    }
+
+    # Free the large logits tensor to save memory — LatentCoTLoss will
+    # skip student CE computation when 'skip_student_ce' is set in cache.
+    # Replace with a tiny placeholder so downstream code doesn't crash.
+    outputs.logits = torch.empty(1, 1, 1, device=dev, dtype=torch.bfloat16)
+
+    # Total loss: only visual_explain_loss (student_ce is not needed for pretrain)
+    outputs.loss = visual_explain_loss
+    if student_ce_loss is not None:
+        logger.info_once(
+            f'[VisualAuxPretrain] loss breakdown (CE from main model ignored for gradient): '
+            f'student_ce={student_ce_loss.item():.4f}, '
+            f'visual_pretrain={visual_explain_loss.item():.4f}')
+
+    return outputs
 
 
 def _latent_cot_forward(
