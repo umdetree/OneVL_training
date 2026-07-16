@@ -67,6 +67,54 @@ def add_latent_tokens_to_tokenizer(processor, as_special_tokens: bool = True):
     return tokenizer
 
 
+# ---------------------------------------------------------------------------
+# Visual token support (IBQ / Emu 3.5 discrete visual codes)
+# ---------------------------------------------------------------------------
+NUM_VISUAL_TOKENS = 131072
+"""Number of discrete visual code tokens from the IBQ visual tokenizer."""
+
+IMAGE_STRUCTURAL_TOKENS = [
+    '<|image start|>', '<|image token|>', '<|image end|>',
+    '<|extra_200|>',
+]
+"""Structural tokens that delimit visual token rows in the image sequence."""
+
+
+def add_visual_tokens_to_tokenizer(tokenizer):
+    """Register 131k discrete visual code tokens + image structural tokens.
+
+    The IBQ visual tokenizer produces 131,072 discrete code IDs.  In the
+    dataset these appear as ``<|visual token NNNNNN|>`` strings.  Without
+    explicit registration they are split into 13+ subword tokens by the BPE
+    tokenizer, which means the aux decoder would predict subword sequences
+    rather than individual visual code IDs.
+
+    This function also registers image structural tokens
+    (``<|image start|>``, ``<|image token|>``, etc.) that delimit rows in
+    the image token raster.
+
+    After calling this, ``tokenizer.encode('<|visual token 000001|>')``
+    returns a single token ID instead of 13 fragments.
+    """
+    existing = set(tokenizer.get_vocab().keys())
+
+    # 1. Image structural tokens (row markers / separators)
+    structural = [t for t in IMAGE_STRUCTURAL_TOKENS if t not in existing]
+    if structural:
+        tokenizer.add_tokens(structural, special_tokens=True)
+
+    # 2. 131k visual code tokens
+    visual_tokens = [f'<|visual token {i:06d}|>' for i in range(NUM_VISUAL_TOKENS)]
+    new_visual = [t for t in visual_tokens if t not in existing]
+    if new_visual:
+        tokenizer.add_tokens(new_visual, special_tokens=True)
+        logger.info(
+            f'[VisualTokens] Added {len(new_visual)} visual code tokens '
+            f'(vocab now {len(tokenizer)})')
+
+    return tokenizer
+
+
 def get_latent_token_ids(tokenizer):
     return {
         'latent_token_id': tokenizer.convert_tokens_to_ids(LATENT_TOKEN),
@@ -445,6 +493,42 @@ def compute_visual_explain_loss(
     return loss_all
 
 
+def _chunked_lm_head_ce(last_hidden, labels, lm_head, chunk_size=512):
+    """Apply lm_head in chunks and compute shifted CE loss.
+
+    This is the core chunked loss computation used by Stage 0.5 pretrain.
+    The LM-Head is applied per-token independently, so chunking produces
+    identical results to computing all logits at once but uses far less
+    peak memory.
+    """
+    loss_fct = CrossEntropyLoss(reduction='sum')
+    shift_labels = labels[0, 1:]  # [seq_len-1]
+    n_tokens = last_hidden.shape[1] - 1
+    total_loss = torch.tensor(0.0, device=last_hidden.device)
+    total_effective = 0
+
+    for c_start in range(0, n_tokens, chunk_size):
+        c_end = min(c_start + chunk_size, n_tokens)
+        chunk_hidden = last_hidden[0, c_start:c_end]  # [chunk, hidden]
+        chunk_labels = shift_labels[c_start:c_end]    # [chunk]
+        chunk_logits = lm_head(chunk_hidden)  # [chunk, vocab]
+
+        effective_mask = (chunk_labels != -100)
+        effective_tokens = effective_mask.sum()
+        if effective_tokens > 0:
+            eff_logits = chunk_logits[effective_mask].float()
+            eff_labels = chunk_labels[effective_mask]
+            item_loss = loss_fct(eff_logits, eff_labels)
+            total_loss = total_loss + item_loss
+            total_effective += effective_tokens.item()
+
+        del chunk_logits
+
+    if total_effective > 0:
+        return total_loss / total_effective
+    return torch.tensor(0.0, device=last_hidden.device)
+
+
 def compute_visual_aux_pretrain_loss(
     visual_ids_list,
     batch_size, visual_aux_decoder,
@@ -470,8 +554,7 @@ def compute_visual_aux_pretrain_loss(
     we use a **chunked LM-Head & Cross Entropy** approach:
     1. Forward the entire sequence through the aux decoder normally
        (preserving full causal attention).
-    2. Discard the full logits tensor; keep only the last hidden states
-       (which are small: ~25 MB for 6300 tokens).
+    2. Discard the full logits tensor; keep only the last hidden states.
     3. Apply the LM-Head projection and CE loss in chunks of
        ``chunk_size`` tokens.  Since the LM-Head is a per-token independent
        linear transformation, chunking produces identical results to
@@ -481,7 +564,6 @@ def compute_visual_aux_pretrain_loss(
         return torch.tensor(0.0, device=student_embeds.device)
 
     vis_aux_embedding = _get_aux_input_embeddings(visual_aux_decoder)
-    loss_fct = CrossEntropyLoss(reduction='sum')
     loss_all = torch.tensor(0.0, device=student_embeds.device)
     num_items = 0
 
@@ -522,9 +604,6 @@ def compute_visual_aux_pretrain_loss(
             f'combined_shape={combined_embeds.shape}, chunk_size={chunk_size}')
 
         # Step 1: Forward through aux decoder — keep hidden states, discard logits
-        # logits_to_keep=1: only keep last token's logits (tiny), since we compute
-        # CE loss via chunked lm_head on hidden_states afterwards.  Without this,
-        # Qwen3-VL internally computes lm_head(all_tokens) ≈ 2.4 GiB → OOM.
         vis_aux_outputs = visual_aux_decoder(
             inputs_embeds=combined_embeds,
             attention_mask=attn_mask,
@@ -533,7 +612,7 @@ def compute_visual_aux_pretrain_loss(
             output_hidden_states=True,
         )
 
-        # Get last hidden states (small: ~25 MB for 6300 tokens at hidden=2048)
+        # Get last hidden states
         last_hidden = vis_aux_outputs.hidden_states[-1]  # [1, seq_len, hidden]
 
         # Build labels: ViT prefix is -100, target part is ground truth
@@ -543,44 +622,17 @@ def compute_visual_aux_pretrain_loss(
             dtype=torch.long, device=student_embeds.device)
         labels[0, prefix_len:] = target_tensor
 
-        # Immediately free the large logits tensor and output object
+        # Immediately free the large output object
         del vis_aux_outputs
         del combined_embeds, attn_mask
         torch.cuda.empty_cache()
 
         # Step 2: Chunked LM-Head projection + CE loss
-        # LM-Head is a per-token independent linear layer, so chunking
-        # produces identical results to computing all logits at once.
-        shift_labels = labels[0, 1:]  # [seq_len-1]
-        total_loss = torch.tensor(0.0, device=student_embeds.device)
-        total_effective = 0
+        item_loss = _chunked_lm_head_ce(last_hidden, labels, lm_head, chunk_size)
+        loss_all = loss_all + item_loss
+        num_items += 1
 
-        n_tokens = last_hidden.shape[1] - 1  # shifted by 1
-        for c_start in range(0, n_tokens, chunk_size):
-            c_end = min(c_start + chunk_size, n_tokens)
-            # hidden at position i predicts token at position i+1 (shifted)
-            chunk_hidden = last_hidden[0, c_start:c_end]  # [chunk, hidden]
-            chunk_labels = shift_labels[c_start:c_end]    # [chunk]
-
-            chunk_logits = lm_head(chunk_hidden)  # [chunk, vocab] bf16
-
-            effective_mask = (chunk_labels != -100)
-            effective_tokens = effective_mask.sum()
-            if effective_tokens > 0:
-                # Only compute CE for effective positions to save memory
-                eff_logits = chunk_logits[effective_mask].float()  # fp32 for numerical stability
-                eff_labels = chunk_labels[effective_mask]
-                item_loss = loss_fct(eff_logits, eff_labels)
-                total_loss = total_loss + item_loss
-                total_effective += effective_tokens.item()
-
-            del chunk_logits, chunk_hidden, chunk_labels, effective_mask
-
-        if total_effective > 0:
-            loss_all = loss_all + total_loss / total_effective
-            num_items += 1
-
-        del last_hidden, labels, shift_labels
+        del last_hidden, labels
 
     if num_items > 0:
         loss_all = loss_all / num_items
@@ -853,52 +905,40 @@ def find_latent_mask_region(ids_list, marker_component_ids, latent_keyword_id):
     return mask
 
 
-def patch_model_for_visual_aux_pretrain(model, processor, config: LatentCoTConfig):
-    """Patch a Qwen3-VL model in-place for visual aux decoder pretrain (Stage 0.5).
+def patch_model_for_visual_aux_pretrain(model, processor):
+    """Patch Qwen3-VL in-place for Stage 0.5 visual aux decoder pretrain.
 
-    Compared to ``patch_model_for_latent_cot``, this function:
-    - Does NOT add latent tokens to the tokenizer (no latent tokens needed)
-    - Does NOT build a text aux decoder (only visual aux decoder)
-    - Does NOT create latent_proj (no latent embeddings to project)
-    - Replaces forward with ``_latent_cot_forward_visual_aux_pretrain``
+    Unlike ``patch_model_for_latent_cot``, this function treats the model
+    itself as the visual aux decoder — no separate aux decoder is loaded,
+    no latent projection layers are created, and no ``LatentCoTConfig`` is
+    needed.
+
+    What this does:
+    1. Registers 131k visual code tokens (+ structural tokens) on the
+       processor's tokenizer and resizes model embeddings.
+    2. Replaces ``model.forward`` with ``_forward_visual_aux_pretrain``
+       which uses ``model.model.visual`` directly to extract ViT features
+       and computes a chunked future-token prediction loss.
+
+    The ViT should be frozen via ``--freeze_vit true`` in the training
+    script so gradients flow only through the LLM.
     """
-    model._latent_cot_config = config
-    model._latent_token_ids = {}  # empty — no latent tokens
-    model._processor_ref = processor
+    # Register 131k visual tokens on the processor's tokenizer, resize model
+    tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+    add_visual_tokens_to_tokenizer(tokenizer)
+    model.resize_token_embeddings(len(tokenizer))
 
-    base_hidden_size = _resolve_hidden_size(model)
+    # Store tokenizer reference for the patched forward
+    model._visual_aux_tokenizer = tokenizer
 
-    # Only build visual aux decoder
-    if config.visual_aux_model_path:
-        logger.info(f'[VisualAuxPretrain] Building visual_aux_decoder from: {config.visual_aux_model_path}')
-        vis_aux_decoder = build_aux_decoder(config.visual_aux_model_path, device='cpu')
-        vis_aux_hidden = _resolve_hidden_size(vis_aux_decoder)
-        visual_latent_proj = nn.Sequential(
-            nn.Linear(base_hidden_size, base_hidden_size),
-            nn.GELU(),
-            nn.Linear(base_hidden_size, vis_aux_hidden),
-            nn.LayerNorm(vis_aux_hidden),
-        )
-        model.add_module('_latent_cot_visual_aux_decoder', vis_aux_decoder)
-        model.add_module('_latent_cot_visual_latent_proj', visual_latent_proj)
+    # Save original forward for inner LLM call, then patch
+    model._origin_forward = model.forward
+    model.forward = MethodType(_forward_visual_aux_pretrain, model)
+    model._latent_cot_cache = {}
 
-        from transformers import AutoTokenizer
-        model._latent_cot_visual_aux_tokenizer = AutoTokenizer.from_pretrained(
-            config.visual_aux_model_path, trust_remote_code=True)
-    else:
-        raise ValueError(
-            'visual_aux_model_path is required for visual aux decoder pretrain. '
-            'Set LATENT_COT_VISUAL_AUX_MODEL_PATH environment variable.')
-
-    # No text aux decoder
-    model._latent_cot_aux_decoder = None
-    model._latent_cot_latent_proj = None
-
-    # Replace forward
-    model._origin_forward_for_latent_cot = model.forward
-    model.forward = MethodType(_latent_cot_forward_visual_aux_pretrain, model)
-
-    logger.info('[VisualAuxPretrain] Model patched for visual aux decoder pretrain.')
+    logger.info(
+        '[Stage0.5] Visual aux decoder pretrain patch applied '
+        f'(vocab_size={len(tokenizer)})')
     return model
 
 
@@ -969,6 +1009,10 @@ def patch_model_for_latent_cot(model, processor, config: LatentCoTConfig, model_
         from transformers import AutoTokenizer
         model._latent_cot_visual_aux_tokenizer = AutoTokenizer.from_pretrained(
             config.visual_aux_model_path, trust_remote_code=True)
+        # Register 131k visual code tokens and resize aux decoder
+        add_visual_tokens_to_tokenizer(model._latent_cot_visual_aux_tokenizer)
+        vis_aux_decoder.resize_token_embeddings(
+            len(model._latent_cot_visual_aux_tokenizer))
     else:
         model._latent_cot_visual_aux_decoder = None
         model._latent_cot_visual_latent_proj = None
@@ -1090,132 +1134,85 @@ def load_latent_cot_weights(model, model_dir: str) -> None:
             logger.warning(f'Unexpected keys when loading latent CoT weights: {unexpected}')
 
 
-def _latent_cot_forward_visual_aux_pretrain(
+def _forward_visual_aux_pretrain(
     self, input_ids=None, attention_mask=None, position_ids=None,
     labels=None, pixel_values=None, pixel_values_videos=None,
     image_grid_thw=None, video_grid_thw=None,
     think_steps=None, future_image_tokens=None,
     **kwargs,
 ):
-    """Patched forward for visual aux decoder pretrain (Stage 0.5).
+    """Patched forward for Stage 0.5 visual aux decoder pretrain.
 
-    Unlike ``_latent_cot_forward``, this function:
-    - Does NOT look for latent tokens (there are none)
-    - Only computes visual aux decoder pretrain loss
-    - The visual aux decoder receives [ViT_embeds, target_embeds] directly,
-      with no latent conditioning
-    - Main model is frozen; only the visual aux decoder is trained
+    The model IS the visual aux decoder.  This forward:
+    1. Runs ``self.model.visual`` + ``self.model.vte`` directly on
+       ``pixel_values`` to obtain visual embeddings.
+    2. Tokenizes ``future_image_tokens`` to obtain target token IDs.
+    3. Builds ``combined_embeds = [vis_embeds, target_embeds]``.
+    4. Forwards through the language model via ``inputs_embeds``.
+    5. Computes chunked LM-head + CE loss on the hidden states.
+
+    No main model is needed — this is a single-model design.
     """
-    config = self._latent_cot_config
-    visual_aux_decoder = getattr(self, '_latent_cot_visual_aux_decoder', None)
+    tokenizer = self._visual_aux_tokenizer
 
-    need_visual = (future_image_tokens is not None and visual_aux_decoder is not None)
-
-    # Register ViT hook to capture embeddings (same mechanism as _latent_cot_forward)
-    _vit_hook_handle = None
-    self._captured_vit_embeds = None
-    if config.visual_aux_visual_condition and need_visual:
-        def _capture_vit_embeds_hook(module, args, kwargs):
-            ie = kwargs.get('inputs_embeds')
-            if ie is not None:
-                self._captured_vit_embeds = ie.detach()
-            return None
-        _lm = getattr(getattr(self, 'model', None), 'language_model', None)
-        if _lm is not None:
-            _vit_hook_handle = _lm.register_forward_pre_hook(
-                _capture_vit_embeds_hook, with_kwargs=True)
-
-    # Run original forward — need hidden states for ViT hook + CE loss
-    outputs = self._origin_forward_for_latent_cot(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        labels=labels,
-        pixel_values=pixel_values,
-        pixel_values_videos=pixel_values_videos,
-        image_grid_thw=image_grid_thw,
-        video_grid_thw=video_grid_thw,
-        output_hidden_states=need_visual,
-        **kwargs,
+    # 1. Run aux decoder's OWN ViT to get visual embeddings
+    #    self.model.visual returns BaseModelOutputWithDeepstackFeatures;
+    #    .pooler_output is the merger-projected LLM-space embeds (list of tensors)
+    vision_output = self.model.visual(
+        hidden_states=pixel_values,
+        grid_thw=image_grid_thw,
     )
+    # pooler_output is a list of tensors: [(n_patches_i, hidden), ...] per image
+    vis_embeds = vision_output.pooler_output  # list of [n_patches, llm_hidden]
+    if isinstance(vis_embeds, (list, tuple)):
+        vis_embeds = vis_embeds[0]  # first image
+    n_vis = vis_embeds.shape[0]  # number of visual patches
 
-    if _vit_hook_handle is not None:
-        _vit_hook_handle.remove()
+    # 2. Tokenize future_image_tokens → target IDs
+    #    future_image_tokens is a string like "<|image start|>12*21<|image token|><|visual token 079275|>..."
+    text = future_image_tokens[0] if isinstance(future_image_tokens, list) else future_image_tokens
+    target_ids = tokenizer.encode(str(text), add_special_tokens=False)
+    if tokenizer.eos_token_id is not None:
+        target_ids = target_ids + [tokenizer.eos_token_id]
+    target_tensor = torch.tensor(
+        target_ids, device=vis_embeds.device, dtype=torch.long)
 
-    dev = (outputs.loss.device if outputs.loss is not None
-           else (input_ids.device if input_ids is not None else 'cuda'))
-    student_ce_loss = outputs.loss if outputs.loss is not None else None
+    # 3. Build combined_embeds = [vis_embeds, target_embeds]
+    target_embeds = self.get_input_embeddings()(target_tensor)
+    combined_embeds = torch.cat([vis_embeds, target_embeds], dim=0).unsqueeze(0)
+    seq_len = combined_embeds.shape[1]
+    attn_mask = torch.ones(1, seq_len, dtype=torch.long, device=vis_embeds.device)
 
-    visual_explain_loss = torch.tensor(0.0, device=dev)
+    # 4. Inner LLM forward via language_model (raw Qwen3VLTextModel)
+    #    Use self.model.language_model directly to bypass swift's
+    #    monkey-patched Qwen3VLModel.forward which requires input_ids != None.
+    lm = self.model.language_model
+    outputs = lm(
+        input_ids=None,
+        attention_mask=attn_mask,
+        inputs_embeds=combined_embeds,
+        use_cache=False,
+        output_hidden_states=True,
+    )
+    last_hidden = outputs.hidden_states[-1]  # [1, seq_len, hidden]
 
-    if need_visual:
-        batch_size = input_ids.size(0)
-        vis_tokenizer = getattr(self, '_latent_cot_visual_aux_tokenizer', None)
-        if vis_tokenizer is not None:
-            visual_ids_list = _tokenize_visual_targets(future_image_tokens, vis_tokenizer)
+    # 5. Build labels: ViT prefix = -100, target part = ground truth
+    labels = torch.full(
+        (1, seq_len), -100,
+        dtype=torch.long, device=vis_embeds.device)
+    labels[0, n_vis:] = target_tensor
 
-            image_token_id = getattr(self.config, 'image_token_id', None)
-            video_token_id = getattr(self.config, 'video_token_id', None)
+    # 6. Chunked LM-head + CE
+    total_loss = _chunked_lm_head_ce(
+        last_hidden, labels, self.lm_head, chunk_size=512)
 
-            debug_aux_vit_holder = {} if _latent_cot_debug_aux_vit_embed() else None
-
-            student_embeds = None
-            if config.visual_aux_visual_condition:
-                student_embeds = self._captured_vit_embeds
-                if student_embeds is not None:
-                    _img_tid = getattr(self.config, 'image_token_id', None)
-                    if _img_tid is not None and input_ids is not None:
-                        _vis_mask = (input_ids[0] == _img_tid)
-                        if _vis_mask.any():
-                            _vit_std = student_embeds[0][_vis_mask].float().std(dim=0).mean().item()
-                            logger.info_once(
-                                f'[VisualAuxPretrain] Using ViT-injected embeddings '
-                                f'(shape={student_embeds.shape}, '
-                                f'n_img_tokens={_vis_mask.sum().item()}, '
-                                f'vit_embed_std_across_positions={_vit_std:.6f})')
-                else:
-                    embed_fn = (self.model.get_input_embeddings()
-                                if hasattr(self, 'model')
-                                else self.get_input_embeddings())
-                    student_embeds = embed_fn(input_ids)
-                    logger.warning_once(
-                        '[VisualAuxPretrain] Hook failed to capture ViT embeddings, '
-                        'falling back to placeholder embeddings')
-
-            visual_explain_loss = compute_visual_aux_pretrain_loss(
-                visual_ids_list,
-                batch_size, visual_aux_decoder,
-                student_embeds, input_ids,
-                image_token_id=image_token_id,
-                video_token_id=video_token_id,
-                debug_aux_vit_holder=debug_aux_vit_holder,
-            )
-            visual_explain_loss = visual_explain_loss * config.visual_explain_loss_weight
-
-            _flush_aux_vit_debug_compare(debug_aux_vit_holder)
-
-    # Store aux losses on the model (same pattern as _latent_cot_forward)
-    self._latent_cot_cache = {
-        'student_ce_loss': student_ce_loss,
-        'explain_loss': torch.tensor(0.0, device=dev),
-        'visual_explain_loss': visual_explain_loss,
-        'skip_student_ce': True,  # pretrain: main model frozen, skip CE from logits
-    }
-
-    # Free the large logits tensor to save memory — LatentCoTLoss will
-    # skip student CE computation when 'skip_student_ce' is set in cache.
-    # Replace with a tiny placeholder so downstream code doesn't crash.
-    outputs.logits = torch.empty(1, 1, 1, device=dev, dtype=torch.bfloat16)
-
-    # Total loss: only visual_explain_loss (student_ce is not needed for pretrain)
-    outputs.loss = visual_explain_loss
-    if student_ce_loss is not None:
-        logger.info_once(
-            f'[VisualAuxPretrain] loss breakdown (CE from main model ignored for gradient): '
-            f'student_ce={student_ce_loss.item():.4f}, '
-            f'visual_pretrain={visual_explain_loss.item():.4f}')
-
-    return outputs
+    # 7. Return minimal output with loss (no logits needed)
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+    logger.info_once(
+        f'[Stage0.5] loss={total_loss.item():.4f}, '
+        f'n_vis={n_vis}, n_target={len(target_ids)}, '
+        f'combined_seq_len={seq_len}')
+    return CausalLMOutputWithPast(loss=total_loss)
 
 
 def _latent_cot_forward(

@@ -7,9 +7,11 @@ set -x
 # Pretrain the visual aux decoder as an independent future-frame
 # generator before integrating it into the full OneVL pipeline.
 #
-# Main model (frozen): extract ViT embeddings only
-# Visual aux decoder (trainable): [ViT_embeds] → [future_tokens]
-# No latent tokens, no text aux decoder.
+# Single-model design: the Qwen3-VL model IS the visual aux
+# decoder.  Its ViT is frozen (feature extraction only) and its
+# LLM is trained to predict future image tokens.
+#
+# No main model, no latent tokens, no separate aux decoder.
 # ============================================================
 
 # ---------- Environment ----------
@@ -31,15 +33,9 @@ NODE_RANK=${ROLE_INDEX:-0}
 MASTER_ADDR=${WORKER_0_HOST:-127.0.0.1}
 MASTER_PORT=${WORKER_0_PORT:-29500}
 
-# ---------- Model paths ----------
+# ---------- Model path ----------
 MODEL_PATH="Qwen/Qwen3-VL-2B-Instruct"
-VISUAL_AUX_MODEL_PATH="Qwen/Qwen3-VL-2B-Instruct"
 DATASET_PATH="${SCRIPT_DIR}/demo_data/navsim/navsim_vis4_text2_demo100.jsonl"
-
-# ---------- Visual Aux Pretrain configuration ----------
-export LATENT_COT_VISUAL_AUX_MODEL_PATH="${VISUAL_AUX_MODEL_PATH}"
-export LATENT_COT_VISUAL_AUX_VISUAL_CONDITION=true
-export LATENT_COT_VISUAL_EXPLAIN_LOSS_WEIGHT=1.0
 
 # ---------- Launch training ----------
 mkdir -p "${SCRIPT_DIR}/logs/navsim"
@@ -62,22 +58,19 @@ swift sft \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --learning_rate 1e-4 \
-    --loss_type latent_cot \
     --lr_scheduler_type cosine \
     --gradient_accumulation_steps 2 \
     --save_steps 100 \
     --eval_steps 100 \
     --save_total_limit 1 \
+    --add_version false \
     --logging_steps 5 \
     --max_length 4096 \
     --warmup_steps 10 \
     --weight_decay 0.05 \
     --freeze_vit true \
-    --freeze_llm true \
-    --freeze_aligner true \
     --dataloader_num_workers 2 \
     --output_dir "${SCRIPT_DIR}/outputs/navsim/qwen3_vl_visual_aux_pretrain_stage0_5_vis4_txt2" \
-    --resume_from_checkpoint "${SCRIPT_DIR}/outputs/navsim/qwen3_vl_visual_aux_pretrain_stage0_5_vis4_txt2/v0-20260715-113754/checkpoint-100" \
     --gradient_checkpointing true \
     --deepspeed zero3 \
   2>&1 | tee "${SCRIPT_DIR}/logs/navsim/qwen3_vl_visual_aux_pretrain_stage0_5_vis4_txt2.log"
