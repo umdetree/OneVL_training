@@ -33,6 +33,7 @@ sortedcontainers>=1.5.9
 tensorboard
 tiktoken
 tqdm
+torch==2.9
 transformers>=4.57.0,<5.4.0
 transformers_stream_generator
 trl>=0.15,<0.29
