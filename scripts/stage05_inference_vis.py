@@ -27,11 +27,9 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-from swift.model.models.latent_cot import add_visual_tokens_to_tokenizer
-from scripts.emu35_image_tokenize_demo import (
+from onevl import add_visual_tokens_to_tokenizer
+from onevl.emu35_tokenizer import (
     load_vision_tokenizer,
     tokens_to_image,
 )
@@ -203,7 +201,7 @@ def predict_autoregressive(
 
 def parse_gt_future_blocks(ft_text: str) -> list[torch.Tensor]:
     """解析 future_image_tokens 字符串为 [H, W] grid 列表。"""
-    from scripts.emu35_image_tokenize_demo import extract_future_blocks, parse_token_block
+    from onevl.emu35_tokenizer import extract_future_blocks, parse_token_block
     blocks = extract_future_blocks(ft_text)
     # extract_future_blocks 返回的是 <|image start|>...<|image end|> 之间的内容，
     # 但 parse_token_block 需要包含标记的完整块，所以重新封装
@@ -224,9 +222,9 @@ def main():
                                 "snapshots/a5c45bdb8084763048e094ae124778bfeca7d5ee/")
     parser.add_argument("--dataset_path", type=str,
                         default="/root/autodl-tmp/OneVL_training/demo_data/navsim/"
-                                "navsim_cot_demo100.jsonl")
+                                "navsim_vis4_text2_demo100.jsonl")
     parser.add_argument("--output_dir", type=str,
-                        default="/root/autodl-tmp/OneVL_training/vis_results_cot")
+                        default="/root/autodl-tmp/OneVL_training/vis_results")
     parser.add_argument("--num_samples", type=int, default=6)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--mode", type=str, default="autoregressive",
