@@ -32,13 +32,21 @@ def visual_aux_pretrain_forward(
     The model IS the visual aux decoder (single-model design).  This
     function:
 
-    1. Runs ``model.model.visual`` on ``pixel_values`` to obtain visual
-       embeddings for the current frame.
-    2. Tokenizes ``future_image_tokens`` (the discrete visual token strings
+    1. Runs ``model.model.get_image_features`` on ``pixel_values`` to obtain visual
+       embeddings for the current frame (returns per-image tuple).
+    2. Iterates over each sample in the batch, tokenizes
+       ``future_image_tokens`` (the discrete visual token strings
        for the next 0.5 s and 1.0 s frames) into target token IDs.
-    3. Builds ``combined_embeds = [vis_embeds, target_embeds]``.
+    3. For each sample, builds ``combined_embeds = [vis_embeds, target_embeds]``.
     4. Forwards through the language model (``model.model.language_model``).
-    5. Computes chunked LM-head + CE loss on the hidden states.
+    5. Computes chunked LM-head + CE loss on the hidden states per sample,
+       then averages across the batch.
+
+    Batch support: ViT processes all images in one forward call
+    (``pooler_output`` returns a list of tensors, one per image).
+    The LLM forward is called per-sample since each sample has a different
+    ``combined_embeds`` sequence length. This matches the pattern used in
+    Stage 1/2 ``compute_visual_explain_loss``.
 
     DeepSpeed ZeRO-3 compatibility:
     - ``model.model.visual`` — ViT parameters are typically small and not
@@ -77,61 +85,73 @@ def visual_aux_pretrain_forward(
           ``seq_len``, and ``loss_value`` for debugging.
     """
     # 1. Run ViT to get visual embeddings
-    vision_output = model.model.visual(
-        hidden_states=pixel_values,
-        grid_thw=image_grid_thw,
+    #    Use get_image_features which returns per-image split pooler_output
+    #    (model.model.visual returns a flat tensor, get_image_features splits it)
+    vision_output = model.model.get_image_features(
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        return_dict=True,
     )
-    vis_embeds = vision_output.pooler_output  # list of [n_patches, hidden]
-    if isinstance(vis_embeds, (list, tuple)):
-        vis_embeds = vis_embeds[0]  # first (only) image
-    n_vis: int = vis_embeds.shape[0]
+    vis_embeds_list = vision_output.pooler_output  # tuple of [n_patches_i, hidden]
+    batch_size = len(vis_embeds_list)
 
-    # 2. Tokenize future_image_tokens → target IDs
-    text = (
-        future_image_tokens[0]
-        if isinstance(future_image_tokens, list)
-        else future_image_tokens
-    )
-    target_ids = tokenizer.encode(str(text), add_special_tokens=False)
-    if tokenizer.eos_token_id is not None:
-        target_ids = target_ids + [tokenizer.eos_token_id]
-    target_tensor = torch.tensor(
-        target_ids, device=vis_embeds.device, dtype=torch.long,
-    )
+    # 2. LLM forward — per-sample loop (each sample has different seq length)
+    total_loss = torch.tensor(0.0, device=pixel_values.device)
+    num_items = 0
 
-    # 3. Build combined_embeds = [vis_embeds, target_embeds]
-    target_embeds = model.get_input_embeddings()(target_tensor)
-    combined_embeds = torch.cat([vis_embeds, target_embeds], dim=0).unsqueeze(0)
-    seq_len = combined_embeds.shape[1]
-    attn_mask = torch.ones(1, seq_len, dtype=torch.long, device=vis_embeds.device)
+    for b in range(batch_size):
+        vis_embeds = vis_embeds_list[b]  # [n_patches, hidden]
+        n_vis = vis_embeds.shape[0]
 
-    # 4. Inner LLM forward via language_model (raw Qwen3VLTextModel)
-    #    Use model.model.language_model to bypass any swift monkey-patches
-    #    on model.model.forward that require input_ids != None.
-    lm = model.model.language_model
-    outputs = lm(
-        input_ids=None,
-        attention_mask=attn_mask,
-        inputs_embeds=combined_embeds,
-        use_cache=False,
-        output_hidden_states=True,
-    )
-    last_hidden = outputs.hidden_states[-1]  # [1, seq_len, hidden]
+        # 2a. Tokenize future_image_tokens → target IDs
+        ft = (
+            future_image_tokens[b]
+            if isinstance(future_image_tokens, list)
+            else future_image_tokens
+        )
+        target_ids = tokenizer.encode(str(ft), add_special_tokens=False)
+        if tokenizer.eos_token_id is not None:
+            target_ids = target_ids + [tokenizer.eos_token_id]
+        target_tensor = torch.tensor(
+            target_ids, device=vis_embeds.device, dtype=torch.long,
+        )
 
-    # 5. Build labels: ViT prefix = -100, target part = ground truth
-    labels = torch.full(
-        (1, seq_len), -100,
-        dtype=torch.long, device=vis_embeds.device,
-    )
-    labels[0, n_vis:] = target_tensor
+        # 2b. Build combined_embeds = [vis_embeds, target_embeds]
+        target_embeds = model.get_input_embeddings()(target_tensor)
+        combined_embeds = torch.cat([vis_embeds, target_embeds], dim=0).unsqueeze(0)
+        seq_len = combined_embeds.shape[1]
+        attn_mask = torch.ones(1, seq_len, dtype=torch.long, device=vis_embeds.device)
 
-    # 6. Chunked LM-head + CE
-    total_loss = chunked_lm_head_ce(
-        last_hidden, labels, model.lm_head, chunk_size=chunk_size,
-    )
+        # 2c. Inner LLM forward via language_model (raw Qwen3VLTextModel)
+        lm = model.model.language_model
+        outputs = lm(
+            input_ids=None,
+            attention_mask=attn_mask,
+            inputs_embeds=combined_embeds,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+        last_hidden = outputs.hidden_states[-1]  # [1, seq_len, hidden]
+
+        # 2d. Build labels: ViT prefix = -100, target part = ground truth
+        labels = torch.full(
+            (1, seq_len), -100,
+            dtype=torch.long, device=vis_embeds.device,
+        )
+        labels[0, n_vis:] = target_tensor
+
+        # 2e. Chunked LM-head + CE
+        item_loss = chunked_lm_head_ce(
+            last_hidden, labels, model.lm_head, chunk_size=chunk_size,
+        )
+        total_loss = total_loss + item_loss
+        num_items += 1
+
+    total_loss = total_loss / num_items if num_items > 0 else total_loss
 
     # 7. Return loss + debug info
     aux_info = {
+        'batch_size': batch_size,
         'n_vis': n_vis,
         'n_target': len(target_ids),
         'seq_len': seq_len,
